@@ -2,6 +2,7 @@ import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runCommand, formatResult, audit } from "./exec.js";
+import { spawnDetached } from "./async.js";
 
 const DEFAULT_PROJECT =
   process.env.GCLOUD_DEFAULT_PROJECT || "ars-nova-org-mcp";
@@ -350,6 +351,126 @@ export const TOOLS = [
       return (
         `default_project: ${DEFAULT_PROJECT}\ndefault_region: ${DEFAULT_REGION}\n\n` +
         formatResult(res)
+      );
+    },
+  },
+
+  {
+    name: "start_deploy",
+    description:
+      "ASYNC deploy. Same inputs as deploy_mcp_from_files, but returns IMMEDIATELY instead of waiting. " +
+      "Use this for any real deploy: the Claude connector layer aborts tool calls at 60 seconds and a " +
+      "Cloud Run source build takes 2-6 minutes, so the synchronous tool will appear to fail even when it " +
+      "succeeds. After calling this, poll check_deploy until it reports Ready.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        service_name: { type: "string" },
+        files: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              content: { type: "string" },
+            },
+            required: ["path", "content"],
+          },
+        },
+        env_vars: {
+          type: "object",
+          additionalProperties: { type: "string" },
+        },
+        allow_unauthenticated: { type: "boolean" },
+        service_account: { type: "string" },
+        memory: { type: "string" },
+        region: { type: "string" },
+        project: { type: "string" },
+      },
+      required: ["service_name", "files"],
+    },
+    handler: async (a) => {
+      if (!Array.isArray(a.files) || !a.files.length)
+        throw new Error("files must be a non-empty array");
+      const dir = await materialize(a.files);
+      const args = [
+        "run",
+        "deploy",
+        a.service_name,
+        "--source",
+        dir,
+        "--region",
+        a.region || DEFAULT_REGION,
+        "--project",
+        a.project || DEFAULT_PROJECT,
+        "--port",
+        "8080",
+        "--quiet",
+      ];
+      if (a.allow_unauthenticated !== false) args.push("--allow-unauthenticated");
+      if (a.service_account) args.push("--service-account", a.service_account);
+      if (a.memory) args.push("--memory", a.memory);
+      const envs = envPairs(a.env_vars);
+      if (envs) args.push("--set-env-vars", envs);
+
+      const { pid, logPath } = spawnDetached("gcloud", args, a.service_name);
+      return (
+        `Deploy started in the background for '${a.service_name}'.\n` +
+        `pid: ${pid}\nlog: ${logPath}\n\n` +
+        `Builds typically take 2-6 minutes. Poll with:\n` +
+        `  check_deploy { "service_name": "${a.service_name}" }`
+      );
+    },
+  },
+
+  {
+    name: "check_deploy",
+    description:
+      "Check whether a Cloud Run service is deployed and Ready, plus the status of the most recent builds. " +
+      "Stateless - it queries Google directly, so it works even if the MCP container was recycled since " +
+      "start_deploy was called. Use after start_deploy, or after any deploy that appeared to time out.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        service_name: { type: "string" },
+        region: { type: "string" },
+        project: { type: "string" },
+      },
+      required: ["service_name"],
+    },
+    handler: async (a) => {
+      const region = a.region || DEFAULT_REGION;
+      const project = a.project || DEFAULT_PROJECT;
+
+      const svc = await runCommand("gcloud", [
+        "run",
+        "services",
+        "describe",
+        a.service_name,
+        "--region",
+        region,
+        "--project",
+        project,
+        "--format",
+        "value(status.url,status.latestReadyRevisionName,status.conditions[0].status,status.conditions[0].message)",
+      ]);
+
+      const builds = await runCommand("gcloud", [
+        "builds",
+        "list",
+        "--region",
+        region,
+        "--project",
+        project,
+        "--limit",
+        "3",
+        "--format",
+        "value(id,status,createTime)",
+      ]);
+
+      return (
+        `=== service: ${a.service_name} ===\n${formatResult(svc)}\n\n` +
+        `=== recent builds ===\n${formatResult(builds)}`
       );
     },
   },
